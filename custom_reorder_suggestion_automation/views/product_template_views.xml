@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_template_form_reorder_suggestion_automation" model="ir.ui.view">
+        <field name="name">product.template.reorder.suggestion.automation.form</field>
+        <field name="model">product.template</field>
+        <field name="inherit_id" ref="stock.view_template_property_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//group[@name='operations']" position="after">
+                <field name="reorder_prerequisites_met" invisible="1"/>
+                <group string="Automated Re-Order Suggestions" name="automated_reorder_suggestions_group"
+                       invisible="not reorder_prerequisites_met">
+                    <field name="automated_reorder_suggestions"/>
+                    <field name="inventory_turns_target"
+                           invisible="not automated_reorder_suggestions"
+                           required="automated_reorder_suggestions"/>
+                    <field name="safety_factor"
+                           invisible="not automated_reorder_suggestions"
+                           required="automated_reorder_suggestions"/>
+                </group>
+            </xpath>
+        </field>
+    </record>
+</odoo>

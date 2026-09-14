@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="product_supplierinfo_tree_view_reorder_suggestion_automation" model="ir.ui.view">
+        <field name="name">product.supplierinfo.reorder.suggestion.automation.tree</field>
+        <field name="model">product.supplierinfo</field>
+        <field name="inherit_id" ref="purchase.product_supplierinfo_tree_view2"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='delay']" position="after">
+                <field name="lead_time_weeks" optional="show"/>
+                <field name="standard_case_quantity" optional="show"/>
+            </xpath>
+        </field>
+    </record>
+
+    <record id="product_supplierinfo_form_view_reorder_suggestion_automation" model="ir.ui.view">
+        <field name="name">product.supplierinfo.reorder.suggestion.automation.form</field>
+        <field name="model">product.supplierinfo</field>
+        <field name="inherit_id" ref="product.product_supplierinfo_form_view"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='delay']/.." position="after">
+                <label for="lead_time_weeks"/>
+                <div>
+                    <field name="lead_time_weeks" class="oe_inline"/> weeks
+                </div>
+                <label for="standard_case_quantity"/>
+                <div>
+                    <field name="standard_case_quantity" class="oe_inline"/>
+                </div>
+            </xpath>
+        </field>
+    </record>
+</odoo>
