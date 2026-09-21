@@ -5,10 +5,14 @@
     'category': 'Inventory/Purchase',
     'author': 'Right Weigh',
     'license': 'LGPL-3',
-    'depends': ['product', 'stock', 'purchase', 'purchase_stock'],
+    'depends': [
+        'product', 'stock', 'purchase', 'purchase_stock',
+        'sale', 'sale_stock', 'mrp', 'sale_mrp', 'stock_dropshipping',
+    ],
     'data': [
         'views/product_template_views.xml',
         'views/product_supplierinfo_views.xml',
+        'views/stock_warehouse_orderpoint_views.xml',
     ],
     'installable': True,
     'application': False,

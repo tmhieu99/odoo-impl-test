@@ -9,7 +9,7 @@ from ..hooks import backfill_lead_time_weeks
 MODULE = 'custom_reorder_suggestion_automation'
 
 
-@tagged('post_install', '-at_install')
+@tagged('post_install', '-at_install', 'custom_reorder_suggestion_automation')
 class TestProductSupplierinfoLeadTimeFields(TransactionCase):
 
     @classmethod

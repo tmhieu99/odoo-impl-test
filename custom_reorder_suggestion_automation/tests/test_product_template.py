@@ -7,7 +7,7 @@ from odoo.tests import Form, TransactionCase, tagged
 MODULE = 'custom_reorder_suggestion_automation'
 
 
-@tagged('post_install', '-at_install')
+@tagged('post_install', '-at_install', 'custom_reorder_suggestion_automation')
 class TestProductTemplateReorderFields(TransactionCase):
 
     @classmethod
