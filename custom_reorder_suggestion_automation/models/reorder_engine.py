@@ -1,7 +1,8 @@
 import logging
 from collections import defaultdict
+from datetime import timedelta
 
-from odoo import api, models
+from odoo import api, fields, models
 
 _logger = logging.getLogger(__name__)
 
@@ -12,13 +13,22 @@ MAX_BOM_DEPTH = 10
 # Longest demand window the WAD calculation needs (12 months).
 DEMAND_WINDOW_DAYS = 365
 
+# Demand windows, in days, mapped to the number of weeks each spans. The
+# greatest of the three averages wins.
+WAD_WINDOWS = {365: 52.0, 182: 26.0, 91: 13.0}
+
+# Below this age a product has no meaningful 3-month average, so its total
+# demand is divided by the weeks it has existed instead (Total WAD).
+NEW_PRODUCT_DAYS = 91
+
 
 class ReorderEngine(models.AbstractModel):
-    """Stage 1 of the re-order suggestion calculation engine: Raw-Goods Demand.
+    """Re-order suggestion calculation engine.
 
-    Turns confirmed sales orders into per-product, per-date demand expressed in
-    each product's reference UoM. Returns plain dicts and never writes — the
-    later stages (WAD / ROP / TOQ, write-back) consume this output.
+    Stage 1 turns confirmed sales orders into per-product, per-date raw-goods
+    demand in each product's reference UoM; stage 2a averages that into a
+    weekly demand figure. Everything here returns plain dicts and never
+    writes — the later stages (ROP / TOQ, write-back) consume this output.
     """
 
     _name = 'custom.reorder.engine'
@@ -124,18 +134,42 @@ class ReorderEngine(models.AbstractModel):
     # BOM explosion
     # -------------------------------------------------------------------------
     @api.model
-    def _is_purchased_parent(self, product):
+    def _explosion_context(self, company):
+        """Per-run state for the BOM walk.
+
+        Built once per company run: the two route ids the leaf test needs, and
+        the memo of already-expanded products. Resolving the external ids here
+        keeps them out of the recursion, which visits a product once per BOM
+        line that mentions it.
+        """
+        buy_route = self.env.ref(
+            'purchase_stock.route_warehouse0_buy', raise_if_not_found=False)
+        manufacture_route = self.env.ref(
+            'mrp.route_warehouse0_manufacture', raise_if_not_found=False)
+        return {
+            'company': company,
+            'buy_route_id': buy_route.id if buy_route else False,
+            'manufacture_route_id': manufacture_route.id if manufacture_route else False,
+            'factors': {},
+        }
+
+    @api.model
+    def _is_purchased_parent(self, product, context=None):
         """A parent that is bought rather than manufactured is not exploded.
 
         "Enabled" means the route is on the product itself, the same reading
         Step 1 uses for the Buy-route prerequisite (category routes excluded).
+        `context` comes from `_explosion_context`; without one the routes are
+        resolved on the spot, so this stays usable as a standalone check.
         """
-        buy_route = self.env.ref('purchase_stock.route_warehouse0_buy', raise_if_not_found=False)
-        manufacture_route = self.env.ref('mrp.route_warehouse0_manufacture', raise_if_not_found=False)
-        routes = product.route_ids
+        if context is None:
+            context = self._explosion_context(self.env.company)
+        route_ids = product.route_ids.ids
+        buy_route_id = context['buy_route_id']
+        manufacture_route_id = context['manufacture_route_id']
         return bool(
-            buy_route and buy_route.id in routes.ids
-            and not (manufacture_route and manufacture_route.id in routes.ids)
+            buy_route_id and buy_route_id in route_ids
+            and not (manufacture_route_id and manufacture_route_id in route_ids)
         )
 
     @api.model
@@ -159,12 +193,13 @@ class ReorderEngine(models.AbstractModel):
         return Bom.search(domain, order='create_date desc, id desc', limit=1)
 
     @api.model
-    def _component_factors(self, product, company, cache, depth=0, path=frozenset()):
+    def _component_factors(self, product, context, depth=0, path=frozenset()):
         """Raw-goods consumed per 1 unit of `product`, in each component's own
         reference UoM: ``{product_id: qty}``.
 
         A product with no BOM (or a purchased parent) is its own demand.
         """
+        cache = context['factors']
         if product.id in cache:
             return cache[product.id]
         if product.id in path:
@@ -177,15 +212,19 @@ class ReorderEngine(models.AbstractModel):
                 'Reorder engine: BOM depth limit (%s) reached at product %s (id %s); '
                 'deeper components are not counted.', MAX_BOM_DEPTH, product.display_name, product.id)
             return {product.id: 1.0}
-        if self._is_purchased_parent(product):
-            return {product.id: 1.0}
+        # A leaf's factors never depend on the path, so memoise them — otherwise
+        # every purchased component is recomputed once per BOM line naming it.
+        if self._is_purchased_parent(product, context):
+            cache[product.id] = {product.id: 1.0}
+            return cache[product.id]
 
         # Kits (phantom) are exploded too: the sale order line keeps the kit
         # product — only the stock moves explode — so kit components are real
         # demand that would otherwise be missed entirely.
-        bom = self._find_bom(product, company)
+        bom = self._find_bom(product, context['company'])
         if not bom or not bom.bom_line_ids or not bom.product_qty:
-            return {product.id: 1.0}
+            cache[product.id] = {product.id: 1.0}
+            return cache[product.id]
 
         # The header quantity is expressed in the BOM's own UoM: a BOM
         # producing 10 units with a line of 3 contributes 0.3 per parent unit.
@@ -200,7 +239,7 @@ class ReorderEngine(models.AbstractModel):
             line_qty = line.product_uom_id._compute_quantity(
                 line.product_qty * header_factor, component.uom_id, round=False)
             sub_factors = self._component_factors(
-                component, company, cache, depth + 1, path | {product.id})
+                component, context, depth + 1, path | {product.id})
             for component_id, component_qty in sub_factors.items():
                 factors[component_id] += component_qty * line_qty
 
@@ -240,7 +279,7 @@ class ReorderEngine(models.AbstractModel):
             dropshipped_ids = set(products.filtered(
                 lambda product: dropship_route.id in product.route_ids.ids).ids)
 
-        cache = {}
+        context = self._explosion_context(company)
         demand = defaultdict(lambda: defaultdict(float))
         for row in rows:
             # A line that names its own route has already been vetted by the
@@ -254,8 +293,91 @@ class ReorderEngine(models.AbstractModel):
             qty = uom._compute_quantity(row['qty'], product.uom_id, round=False)
             demand_date = row['demand_date'].date()
             factors = self._component_factors(
-                product.with_company(company), company, cache)
+                product.with_company(company), context)
             for component_id, factor in factors.items():
                 if component_id in tracked_ids:
                     demand[component_id][demand_date] += qty * factor
         return {product_id: dict(dated) for product_id, dated in demand.items()}
+
+    # -------------------------------------------------------------------------
+    # Stage 2a — Weekly Average Demand
+    # -------------------------------------------------------------------------
+    @api.model
+    def _product_age_days(self, product, dated_qty, today=None):
+        """How long this product has really existed, in days.
+
+        `create_date` alone is the date the *record* appeared in Odoo, not the
+        date the product did. When a catalogue is imported at go-live every
+        product carries the import date, so a SKU with a year of imported
+        history would look days old — and Total WAD would divide that year of
+        demand by a week or two, over-ordering by an order of magnitude.
+
+        Taking the earliest of `create_date` and the product's own oldest
+        demand makes imported history self-correcting: a product with sales
+        from 300 days ago is at least 300 days old whatever its record says.
+        The variant's `create_date` is used, not the template's, because demand
+        is counted per variant.
+        """
+        today = today or fields.Date.today()
+        created = product.create_date
+        earliest = created.date() if created else today
+        if dated_qty:
+            earliest = min(earliest, min(dated_qty))
+        return max(0, (today - earliest).days)
+
+    @api.model
+    def _compute_wad(self, dated_qty, product, today=None):
+        """Weekly Average Demand for one product, from its dated demand.
+
+        Two paths, as the specification has it:
+
+        - **Greatest WAD** — the demand inside each of the 365 / 182 / 91-day
+          windows divided by 52 / 26 / 13 weeks; the largest of the three wins,
+          so a recent surge is never averaged away by a quiet year.
+        - **Total WAD** — for a product younger than 91 days, total demand
+          divided by the weeks it has existed, since no 3-month average exists
+          yet.
+
+        Pure: it reads `product.create_date` and nothing else from the
+        database, so it can be checked against hand-computed values.
+        """
+        if not dated_qty:
+            return 0.0
+        today = today or fields.Date.today()
+        age_days = self._product_age_days(product, dated_qty, today)
+
+        if age_days < NEW_PRODUCT_DAYS:
+            # The floor keeps a product created today from dividing by zero; it
+            # makes that product's WAD equal its whole demand, which is
+            # aggressive but bounded.
+            weeks = max(1.0, age_days / 7.0)
+            return sum(dated_qty.values()) / weeks
+
+        wads = []
+        for window, weeks in WAD_WINDOWS.items():
+            total = sum(qty for day, qty in dated_qty.items()
+                        if (today - day).days <= window)
+            wads.append(total / weeks)
+        return max(wads)
+
+    @api.model
+    def _collect_wad(self, tracked, company, date_from=None, today=None):
+        """``{product_id: {'wad': float, 'rgd': {date: qty}, 'new_product': bool}}``.
+
+        One Stage 1 run, then the average per product — so a caller that needs
+        both figures pays for the demand collection once.
+        """
+        today = today or fields.Date.today()
+        if date_from is None:
+            date_from = fields.Datetime.now() - timedelta(days=DEMAND_WINDOW_DAYS)
+        rgd = self._collect_rgd(tracked, company, date_from)
+        result = {}
+        for product in tracked:
+            dated_qty = rgd.get(product.id, {})
+            result[product.id] = {
+                'rgd': dated_qty,
+                'wad': self._compute_wad(dated_qty, product, today),
+                'new_product': bool(dated_qty) and self._product_age_days(
+                    product, dated_qty, today) < NEW_PRODUCT_DAYS,
+            }
+        return result

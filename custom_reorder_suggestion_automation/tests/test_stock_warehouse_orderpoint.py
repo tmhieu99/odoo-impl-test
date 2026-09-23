@@ -58,7 +58,6 @@ class TestReorderSuggestionReplenishmentPage(TransactionCase):
         expected = {
             'Snooze': ('action', str(snooze_action.id)),
             'Reorder': ('object', 'action_replenish'),
-            'Automate': ('object', 'action_replenish_auto'),
         }
         for label, (btn_type, name) in expected.items():
             with self.subTest(button=label):
@@ -66,6 +65,27 @@ class TestReorderSuggestionReplenishmentPage(TransactionCase):
                 self.assertEqual(len(buttons), 1)
                 self.assertEqual(buttons[0].get('type'), btn_type)
                 self.assertEqual(buttons[0].get('name'), name)
+
+    def test_row_buttons_key_off_the_custom_to_order(self):
+        arch = self._list_arch()
+        for label in ('Snooze', 'Reorder'):
+            with self.subTest(button=label):
+                invisible = arch.xpath(f"//button[@string='{label}']")[0].get('invisible')
+                self.assertIn('reorder_to_order', invisible)
+                # Native qty_to_order must not drive the custom page.
+                self.assertNotIn('qty_to_order', invisible)
+        # Native write() raises a UserError when an 'auto' row is snoozed, so
+        # that guard has to survive alongside the quantity condition.
+        snooze = arch.xpath("//button[@string='Snooze']")[0].get('invisible')
+        self.assertIn("trigger != 'manual'", snooze)
+
+    def test_automate_button_is_not_offered(self):
+        # action_replenish_auto sets trigger='auto', and the scheduler's domain
+        # is [('trigger','=','auto'), ...] — one click would turn a suggestion
+        # into unattended nightly purchasing. Snooze + manual Reorder only.
+        arch = self._list_arch()
+        self.assertFalse(arch.xpath("//button[@name='action_replenish_auto']"))
+        self.assertFalse(arch.xpath("//button[@string='Automate']"))
 
     def test_placeholder_methods_removed(self):
         for name in ('action_reorder_suggestion_snooze', 'action_reorder_suggestion_reorder',
@@ -94,11 +114,6 @@ class TestReorderSuggestionReplenishmentPage(TransactionCase):
         self.assertEqual(line.product_qty, 5.0)
         self.assertEqual(line.partner_id, self.vendor)
 
-    def test_automate_sets_trigger_auto_and_orders(self):
-        orderpoint = self._create_orderpoint(qty_to_order_manual=5.0)
-        orderpoint.action_replenish_auto()
-        self.assertEqual(orderpoint.trigger, 'auto')
-        self.assertTrue(self.env['purchase.order.line'].search([('product_id', '=', self.product.id)]))
 
 
 @tagged('post_install', '-at_install', 'custom_reorder_suggestion_automation')

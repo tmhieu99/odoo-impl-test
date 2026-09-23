@@ -82,6 +82,21 @@ class ReorderEngineCommon(TransactionCase):
         order.invalidate_recordset(['date_order'])
 
     @classmethod
+    def _backdate_product(cls, product, days):
+        """Age a product. Both rows are updated: the variant carries the date
+        the engine reads, the template keeps them consistent."""
+        moment = fields.Datetime.now() - timedelta(days=days)
+        product.flush_recordset()
+        cls.env.cr.execute(
+            'UPDATE product_product SET create_date = %s WHERE id = %s',
+            (moment, product.id))
+        cls.env.cr.execute(
+            'UPDATE product_template SET create_date = %s WHERE id = %s',
+            (moment, product.product_tmpl_id.id))
+        product.invalidate_recordset(['create_date'])
+        product.product_tmpl_id.invalidate_recordset(['create_date'])
+
+    @classmethod
     def _sell(cls, product, qty, days_ago, state='sale', company=None, route=None):
         company = company or cls.company_a
         line = {'product_id': product.id, 'product_uom_qty': qty}
@@ -107,6 +122,13 @@ class ReorderEngineCommon(TransactionCase):
         tracked = self.engine._eligible_products(company)
         date_from = fields.Datetime.now() - timedelta(days=DEMAND_WINDOW_DAYS)
         return self.engine._collect_rgd(tracked, company, date_from)
+
+    def _wad(self, product, company=None):
+        company = company or self.company_a
+        tracked = self.engine._eligible_products(company)
+        date_from = fields.Datetime.now() - timedelta(days=DEMAND_WINDOW_DAYS)
+        figures = self.engine._collect_wad(tracked, company, date_from)
+        return figures.get(product.id, {'wad': 0.0, 'new_product': False})
 
     def _total(self, rgd, product, window=DEMAND_WINDOW_DAYS):
         today = date.today()
@@ -286,3 +308,77 @@ class TestReorderEngineRgdMultiCompany(ReorderEngineCommon):
 
     def test_company_b_gets_its_own_demand(self):
         self.assertAlmostEqual(self._total(self._rgd(self.company_b), self.cmp_1), 26.0, places=2)
+
+
+@tagged('post_install', '-at_install', 'custom_reorder_suggestion_automation')
+class TestReorderEngineWad(ReorderEngineCommon):
+    """Stage 2a: Greatest WAD and the Total WAD path for new products."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.cmp_1 = cls._component('RW-CMP-1')
+        cls.new_1 = cls._component('RW-NEW-1')
+        cls.quiet = cls._component('RW-QUIET')
+        cls.fg_a = cls._parent('RW-FG-A', cls.manufacture_route)
+        cls._bom(cls.fg_a, [(cls.cmp_1, 2, None)])
+
+        # CMP-1: 140 / 100 / 80 across the three windows.
+        cls._sell(cls.fg_a, 10, 300)
+        cls._sell(cls.fg_a, 10, 200)
+        cls._sell(cls.fg_a, 10, 100)
+        cls._sell(cls.fg_a, 30, 30)
+        cls._sell(cls.cmp_1, 20, 10)
+
+        # NEW-1: created 35 days ago, one sale of 50 a fortnight ago.
+        cls._sell(cls.new_1, 50, 14)
+        cls._backdate_product(cls.new_1, 35)
+
+    def test_greatest_window_wins(self):
+        # 140/52 = 2.6923, 100/26 = 3.8462, 80/13 = 6.1538 -> the 3-month
+        # window, so a recent surge is not averaged away by a quiet year.
+        self.assertAlmostEqual(self._wad(self.cmp_1)['wad'], 6.1538, places=3)
+        self.assertFalse(self._wad(self.cmp_1)['new_product'])
+
+    def test_total_wad_for_a_new_product(self):
+        # 35 days old -> 5 weeks; 50 units / 5 = 10.0 per week.
+        figures = self._wad(self.new_1)
+        self.assertAlmostEqual(figures['wad'], 10.0, places=3)
+        self.assertTrue(figures['new_product'])
+
+    def test_imported_history_does_not_trigger_total_wad(self):
+        """A young record with old demand is an import, not a new product."""
+        # Same product, but now sold 300 days ago as well: its real age is at
+        # least 300 days, so the windowed path must be used. Without the guard
+        # this would read (50 + 12) / 5 = 12.4 instead of ~2.38.
+        self._sell(self.new_1, 12, 300)
+        figures = self._wad(self.new_1)
+        self.assertFalse(figures['new_product'])
+        self.assertAlmostEqual(figures['wad'], 50 / 13.0, places=3)
+
+    def test_product_created_today_uses_the_one_week_floor(self):
+        today_product = self._component('RW-TODAY')
+        self._sell(today_product, 7, 0)
+        figures = self._wad(today_product)
+        self.assertTrue(figures['new_product'])
+        # max(1.0, 0/7) -> the whole demand lands in a single week.
+        self.assertAlmostEqual(figures['wad'], 7.0, places=3)
+
+    def test_ninety_one_days_is_not_a_new_product(self):
+        boundary = self._component('RW-BOUNDARY')
+        self._sell(boundary, 26, 30)
+        self._backdate_product(boundary, 91)
+        figures = self._wad(boundary)
+        self.assertFalse(figures['new_product'])
+        self.assertAlmostEqual(figures['wad'], 26 / 13.0, places=3)
+
+    def test_no_demand_is_zero_not_a_division_error(self):
+        figures = self._wad(self.quiet)
+        self.assertEqual(figures['wad'], 0.0)
+        self.assertFalse(figures['new_product'])
+
+    def test_wad_is_computed_per_company(self):
+        company_b = self.env['res.company'].create({'name': 'RW WAD Company B'})
+        self.env['stock.warehouse'].search([('company_id', '=', company_b.id)], limit=1)
+        self.assertAlmostEqual(self._wad(self.cmp_1)['wad'], 6.1538, places=3)
+        self.assertEqual(self._wad(self.cmp_1, company_b)['wad'], 0.0)

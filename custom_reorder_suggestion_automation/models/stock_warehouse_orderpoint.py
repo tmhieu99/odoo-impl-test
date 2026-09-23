@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from odoo import api, fields, models
+from odoo import _, api, fields, models
 
 
 class StockWarehouseOrderpoint(models.Model):
@@ -36,6 +36,14 @@ class StockWarehouseOrderpoint(models.Model):
              'the re-order calculation engine (1.3) is implemented.',
         store=True
     )
+    reorder_no_vendor = fields.Char(
+        string='Vendor Warning',
+        compute='_compute_reorder_vendor_id',
+        help='Shows a "No Vendor" badge when the product has no vendor for this '
+             'orderpoint, so no suggested vendor can be picked.',
+        store=True
+    )
+  
 
     # --- Mockup display columns (no native orderpoint equivalent) ---
     reorder_description = fields.Char(
@@ -48,10 +56,10 @@ class StockWarehouseOrderpoint(models.Model):
         digits='Product Unit of Measure',
     )
 
-    # --- Diagnostic column (Stage 1 engine output, not a PDF requirement) ---
+    # --- Diagnostic columns (engine output, not PDF requirements) ---
     reorder_rgd = fields.Float(
         string='RGD (12 months)',
-        compute='_compute_reorder_rgd',
+        compute='_compute_reorder_diagnostics',
         digits='Product Unit of Measure',
         help='Raw-Goods Demand over the last 365 days as the calculation engine '
              'sees it: direct sales of this product plus its share of every '
@@ -59,19 +67,39 @@ class StockWarehouseOrderpoint(models.Model):
              'for verifying the engine; the stored Min / Max / To Order values '
              'come from the later stages.',
     )
+    reorder_wad = fields.Float(
+        string='WAD (weekly)',
+        compute='_compute_reorder_diagnostics',
+        digits='Product Unit of Measure',
+        help='Weekly Average Demand: the greatest of the 12-, 6- and 3-month '
+             'averages, so a recent surge is never averaged away by a quiet '
+             'year. Products younger than 91 days use their total demand '
+             'divided by the weeks they have existed instead.',
+    )
+    reorder_wad_is_total = fields.Boolean(
+        string='New Product WAD',
+        compute='_compute_reorder_diagnostics',
+        help='This product is younger than 91 days, so its weekly demand comes '
+             'from its total sales divided by its age rather than from the '
+             'three standard windows.',
+    )
 
     @api.depends('product_id', 'company_id')
-    def _compute_reorder_rgd(self):
-        # One engine run per company rather than one per row.
+    def _compute_reorder_diagnostics(self):
+        # One engine run per company rather than one per row, and one run for
+        # all three columns rather than one each.
         engine = self.env['custom.reorder.engine']
         date_from = fields.Datetime.now() - timedelta(days=365)
         for company, orderpoints in self.grouped('company_id').items():
-            demand = {}
+            figures = {}
             if company:
-                demand = engine._collect_rgd(orderpoints.product_id, company, date_from)
+                figures = engine._collect_wad(
+                    orderpoints.product_id, company, date_from)
             for orderpoint in orderpoints:
-                orderpoint.reorder_rgd = sum(
-                    demand.get(orderpoint.product_id.id, {}).values())
+                product_figures = figures.get(orderpoint.product_id.id) or {}
+                orderpoint.reorder_rgd = sum(product_figures.get('rgd', {}).values())
+                orderpoint.reorder_wad = product_figures.get('wad', 0.0)
+                orderpoint.reorder_wad_is_total = product_figures.get('new_product', False)
 
     @api.depends('product_id', 'company_id', 'product_id.seller_ids.partner_id',
                  'product_id.seller_ids.company_id', 'product_id.seller_ids.sequence',
@@ -80,6 +108,7 @@ class StockWarehouseOrderpoint(models.Model):
         for orderpoint in self:
             product = orderpoint.product_id.with_company(orderpoint.company_id)
             orderpoint.reorder_vendor_id = product._prepare_sellers()[:1].partner_id
+            orderpoint.reorder_no_vendor = (_('No Vendor') if not orderpoint.reorder_vendor_id else False)
 
     @api.depends('product_id')
     def _compute_reorder_quantities(self):
