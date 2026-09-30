@@ -1,4 +1,5 @@
 import logging
+import math
 from collections import defaultdict
 from datetime import timedelta
 
@@ -27,8 +28,10 @@ class ReorderEngine(models.AbstractModel):
 
     Stage 1 turns confirmed sales orders into per-product, per-date raw-goods
     demand in each product's reference UoM; stage 2a averages that into a
-    weekly demand figure. Everything here returns plain dicts and never
-    writes — the later stages (ROP / TOQ, write-back) consume this output.
+    weekly demand figure; stage 2b/3 turns that average, the vendor lead-time
+    and the native Forecasted quantity into a Reorder Point and a To-Order
+    Quantity. Everything here returns plain values and never writes — the
+    orderpoint model consumes this output and stores the Min / Max / To Order.
     """
 
     _name = 'custom.reorder.engine'
@@ -381,3 +384,66 @@ class ReorderEngine(models.AbstractModel):
                     product, dated_qty, today) < NEW_PRODUCT_DAYS,
             }
         return result
+
+    # -------------------------------------------------------------------------
+    # Stage 2b / 3 — Reorder Point and To-Order Quantity (pure math)
+    # -------------------------------------------------------------------------
+    @api.model
+    def _vendor_reorder_params(self, product, company):
+        """Lead-time, MOQ and case quantity from `product`'s preferred vendor
+        for `company`, or ``None`` when it has no vendor.
+
+        Vendor preference follows Odoo's native list order (the same
+        `_prepare_sellers` the Suggested Vendor column uses), so ROP/TOQ read
+        their inputs from exactly the vendor shown on the page. No vendor means
+        the calculation stops and the page warns instead of showing values.
+        """
+        seller = product.with_company(company)._prepare_sellers()[:1]
+        if not seller:
+            return None
+        return {
+            'lead_time_weeks': seller.lead_time_weeks,
+            'min_quantity': seller.min_qty,
+            'standard_case_quantity': seller.standard_case_quantity,
+        }
+
+    @api.model
+    def _reorder_point(self, wad, lead_time_weeks, safety_factor):
+        """ROP = Greatest WAD x (Lead-time weeks + Safety Factor weeks).
+
+        Pure: the caller supplies the vendor lead-time and the product's safety
+        factor, so it can be checked against hand-computed values.
+        """
+        return wad * (lead_time_weeks + safety_factor)
+
+    @api.model
+    def _final_toq(self, wad, rop, forecast, inventory_turns_target,
+                   min_quantity, standard_case_quantity):
+        """Final To-Order Quantity, or 0.0 when the SKU is not below its ROP.
+
+        The reorder flag is ``forecast < rop``; only a flagged SKU is ordered,
+        so a SKU at or above its reorder point returns 0.0 and suggests no PO.
+        The five steps follow the specification exactly:
+
+        - Base TOQ      = (Greatest WAD x 52) / Inventory Turns Target
+        - ROP shortfall = ROP - Forecast
+        - Unrounded     = Base TOQ + ROP shortfall
+        - MOQ-adjusted  = MAX(vendor MOQ, Unrounded)
+        - Final TOQ     = ROUNDUP(MOQ-adjusted / Standard Case Qty) × Case Qty
+
+        Pure, for the same reason `_reorder_point` is. The turns/case divisors
+        are guarded so a misconfigured product degrades gracefully instead of
+        crashing the replenishment list's compute.
+        """
+        if forecast >= rop:
+            return 0.0
+
+        base_toq = (wad * 52.0) / inventory_turns_target if inventory_turns_target else 0.0
+        unrounded_toq = base_toq + (rop - forecast)
+        moq_adjusted_toq = max(min_quantity, unrounded_toq)
+
+        if standard_case_quantity and standard_case_quantity > 0:
+            cases = math.ceil(moq_adjusted_toq / standard_case_quantity)
+            return float(cases * standard_case_quantity)
+
+        return moq_adjusted_toq

@@ -7,7 +7,7 @@
         <field name="model">stock.warehouse.orderpoint</field>
         <field name="arch" type="xml">
             <list string="Re-Order Suggestions" editable="bottom" create="false" export_xlsx="0"
-                    decoration-warning="reorder_no_vendor">
+                    decoration-warning="not reorder_vendor_id">
                 <field name="product_id" string="Product" readonly="product_id" force_save="1"
                        context="{'default_is_storable': True}"/>
                 <field name="reorder_description"/>
@@ -18,7 +18,14 @@
                 <field name="qty_forecast" force_save="1"/>
                 <field name="route_id" string="Routes" options="{'no_create': True, 'no_open': True}" optional="show"/>
                 <field name="reorder_vendor_id" string="Vendor"/>
-                <field name="reorder_no_vendor" string="" widget="badge" decoration-warning="reorder_no_vendor"/>
+                <!-- "No Vendor" badge: a button styled as a badge rather than a
+                     stored warning field — an empty Vendor cell is the warning,
+                     and clicking it opens the product where the vendor line is
+                     added. -->
+                <button name="action_open_product_vendors" type="object" string="No Vendor"
+                        class="badge rounded-pill text-bg-warning border-0"
+                        title="No vendor on this product, so no suggested vendor and no calculated quantities. Click to add one."
+                        invisible="reorder_vendor_id"/>
                 <field name="reorder_min" string="Min"/>
                 <field name="reorder_max" string="Max"/>
                 <field name="reorder_to_order" string="To Order"/>
@@ -39,8 +46,12 @@
                 <!-- Snooze + manual Reorder only. Native "Automate"
                      (action_replenish_auto) is deliberately not offered: it flips
                      trigger to 'auto', which hands the row to the nightly
-                     scheduler and turns a suggestion into unattended purchasing. -->
-                <button name="action_replenish" string="Reorder" type="object"
+                     scheduler and turns a suggestion into unattended purchasing.
+                     Reorder goes through the custom wrapper, which orders the
+                     suggested To Order (Final TOQ) via the native replenish
+                     flow; the native page keeps calling action_replenish and so
+                     keeps ordering the native quantity. -->
+                <button name="action_reorder_suggestion_replenish" string="Reorder" type="object"
                         class="o_replenish_buttons" icon="fa-truck"
                         invisible="reorder_to_order &lt;= 0.0"/>
             </list>
@@ -70,16 +81,27 @@
         <field name="view_mode">list</field>
         <field name="view_id" ref="view_reorder_suggestion_replenishment_list"/>
         <field name="search_view_id" ref="view_reorder_suggestion_replenishment_search"/>
+        <!-- Only SKUs opted into the suggestion flow. Without this the page is a
+             second copy of native Reordering Rules: it would list every
+             orderpoint in the database, including manufactured products that
+             have no Buy route and can never produce a purchase suggestion.
+             `automated_reorder_suggestions` is delegated from product.template,
+             and it can only be True while Track Inventory, Can be Purchased and
+             the Buy route are all set (it auto-clears otherwise), so the route
+             check is implied. -->
+        <field name="domain">[('product_id.automated_reorder_suggestions', '=', True)]</field>
         <field name="context">{
             'search_default_groupby_vendor': 1,
             'search_default_filter_not_snoozed': 1,
         }</field>
         <field name="help" type="html">
             <p class="o_view_nocontent_smiling_face">
-                No re-order suggestions to display yet (mockup).
+                No re-order suggestions to display.
             </p>
             <p>
-                This is the custom Re-Order Suggestions page. Rows and calculated
+                This page lists only products with <b>Automated Reorder Suggestions</b>
+                enabled on the product form (Purchase tab), which requires Track
+                Inventory, Can be Purchased and the Buy route. Calculated
                 Min / Max / To Order values are produced by the re-order
                 calculation engine.
             </p>

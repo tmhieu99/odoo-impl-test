@@ -382,3 +382,49 @@ class TestReorderEngineWad(ReorderEngineCommon):
         self.env['stock.warehouse'].search([('company_id', '=', company_b.id)], limit=1)
         self.assertAlmostEqual(self._wad(self.cmp_1)['wad'], 6.1538, places=3)
         self.assertEqual(self._wad(self.cmp_1, company_b)['wad'], 0.0)
+
+
+@tagged('post_install', '-at_install', 'custom_reorder_suggestion_automation')
+class TestReorderEngineRopToq(TransactionCase):
+    """Stage 2b/3: the pure ROP and Final TOQ formulas, hand-checked."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.engine = cls.env['custom.reorder.engine']
+
+    def test_rop_is_wad_times_lead_plus_safety(self):
+        self.assertAlmostEqual(self.engine._reorder_point(6.0, 2, 1), 18.0, places=6)
+
+    def test_no_toq_when_forecast_meets_or_exceeds_rop(self):
+        # forecast == rop and forecast > rop both clear the reorder flag.
+        self.assertEqual(self.engine._final_toq(2.0, 6.0, 6.0, 6, 1.0, 12), 0.0)
+        self.assertEqual(self.engine._final_toq(2.0, 6.0, 10.0, 6, 1.0, 12), 0.0)
+
+    def test_final_toq_rounds_up_to_the_case(self):
+        # base 2*52/6 = 17.333; + shortfall (6-0) = 23.333; MOQ 1;
+        # ceil(23.333/12) = 2 -> 24.
+        self.assertAlmostEqual(
+            self.engine._final_toq(2.0, 6.0, 0.0, 6, 1.0, 12), 24.0, places=6)
+
+    def test_moq_floors_the_quantity(self):
+        # Tiny demand, large MOQ: the MOQ wins, then rounds to the case.
+        # base 0; shortfall (10-8) = 2; unrounded 2; MOQ 50 -> 50;
+        # ceil(50/12) = 5 -> 60.
+        self.assertAlmostEqual(
+            self.engine._final_toq(0.0, 10.0, 8.0, 6, 50.0, 12), 60.0, places=6)
+
+    def test_case_of_one_rounds_up_to_whole_units(self):
+        # ceil(23.333/1) = 24.
+        self.assertAlmostEqual(
+            self.engine._final_toq(2.0, 6.0, 0.0, 6, 1.0, 1), 24.0, places=6)
+
+    def test_zero_turns_target_degrades_without_crashing(self):
+        # The Base TOQ term drops out; only the ROP shortfall remains.
+        # shortfall (6-0) = 6; MOQ 1; ceil(6/12) = 1 -> 12.
+        self.assertAlmostEqual(
+            self.engine._final_toq(2.0, 6.0, 0.0, 0, 1.0, 12), 12.0, places=6)
+
+    def test_zero_case_quantity_skips_rounding(self):
+        self.assertAlmostEqual(
+            self.engine._final_toq(2.0, 6.0, 0.0, 6, 1.0, 0), 23.3333, places=3)

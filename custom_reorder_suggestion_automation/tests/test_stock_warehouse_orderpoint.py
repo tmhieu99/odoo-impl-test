@@ -1,8 +1,10 @@
 from ast import literal_eval
+from datetime import timedelta
 
 from lxml import etree
 
-from odoo import Command
+from odoo import Command, fields
+from odoo.exceptions import UserError
 from odoo.tests import Form, TransactionCase, tagged
 
 MODULE = 'custom_reorder_suggestion_automation'
@@ -55,9 +57,12 @@ class TestReorderSuggestionReplenishmentPage(TransactionCase):
     def test_action_buttons_use_native_logic(self):
         arch = self._list_arch()
         snooze_action = self.env.ref('stock.action_orderpoint_snooze')
+        # Reorder goes through the custom wrapper, which stages Final TOQ and
+        # then runs native action_replenish; the native page's own button still
+        # calls action_replenish directly and orders the native quantity.
         expected = {
             'Snooze': ('action', str(snooze_action.id)),
-            'Reorder': ('object', 'action_replenish'),
+            'Reorder': ('object', 'action_reorder_suggestion_replenish'),
         }
         for label, (btn_type, name) in expected.items():
             with self.subTest(button=label):
@@ -113,6 +118,57 @@ class TestReorderSuggestionReplenishmentPage(TransactionCase):
         self.assertEqual(len(line), 1)
         self.assertEqual(line.product_qty, 5.0)
         self.assertEqual(line.partner_id, self.vendor)
+
+    # -------------------------------------------------------------------------
+    # Which rows the page lists
+    # -------------------------------------------------------------------------
+    def _flagged_product(self, name):
+        return self.env['product.product'].create({
+            'name': name,
+            'is_storable': True,
+            'purchase_ok': True,
+            'route_ids': [Command.set(self.env.ref('purchase_stock.route_warehouse0_buy').ids)],
+            'automated_reorder_suggestions': True,
+            'inventory_turns_target': 4.0,
+            'safety_factor': 2,
+        })
+
+    def _action_rows(self):
+        return self.Orderpoint.search(literal_eval(self.action.domain))
+
+    def test_action_lists_only_products_in_the_suggestion_flow(self):
+        """A manufactured product with a reordering rule is not a suggestion.
+
+        Without the action's domain the page is a second copy of native
+        Reordering Rules: it lists every orderpoint row, and a Manufacture-only
+        product shows up with no vendor and no calculated quantities.
+        """
+        flagged = self._flagged_product('Flagged Suggestion Product')
+        manufactured = self.env['product.product'].create({
+            'name': 'Manufactured Only Product',
+            'is_storable': True,
+            'route_ids': [Command.set(
+                self.env.ref('mrp.route_warehouse0_manufacture').ids)],
+        })
+        self.assertFalse(manufactured.automated_reorder_suggestions)
+
+        flagged_orderpoint = self._create_orderpoint(product_id=flagged.id)
+        manufactured_orderpoint = self._create_orderpoint(product_id=manufactured.id)
+
+        rows = self._action_rows()
+        self.assertIn(flagged_orderpoint, rows)
+        self.assertNotIn(manufactured_orderpoint, rows)
+
+    def test_action_drops_rows_when_the_flag_is_cleared(self):
+        """Losing a prerequisite clears the flag, so the row leaves the page."""
+        flagged = self._flagged_product('Buy Route Removed Product')
+        orderpoint = self._create_orderpoint(product_id=flagged.id)
+        self.assertIn(orderpoint, self._action_rows())
+
+        flagged.write({'route_ids': [Command.clear()]})
+
+        self.assertFalse(flagged.automated_reorder_suggestions)
+        self.assertNotIn(orderpoint, self._action_rows())
 
 
 
@@ -207,3 +263,151 @@ class TestReorderSuggestionMultiCompany(TransactionCase):
         receipt.action_confirm()
         self.assertEqual(orderpoint_a.reorder_on_order, 7.0)
         self.assertEqual(orderpoint_b.reorder_on_order, 0.0)
+
+
+@tagged('post_install', '-at_install', 'custom_reorder_suggestion_automation')
+class TestReorderSuggestionQuantities(TransactionCase):
+    """End-to-end Min / Max / To Order: the engine's ROP/TOQ math wired to
+    vendor params, template fields and the native Forecast on the orderpoint."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.company = cls.env.ref('base.main_company')
+        cls.warehouse = cls.env['stock.warehouse'].search(
+            [('company_id', '=', cls.company.id)], limit=1)
+        cls.buy_route = cls.env.ref('purchase_stock.route_warehouse0_buy')
+        cls.manufacture_route = cls.env.ref('mrp.route_warehouse0_manufacture')
+        cls.customer = cls.env['res.partner'].create({'name': 'Qty Customer'})
+        cls.vendor = cls.env['res.partner'].create({'name': 'Qty Vendor'})
+        # Bought component, flagged, 6 turns/year and 1 week of safety stock.
+        cls.component = cls.env['product.product'].create({
+            'name': 'Qty Component',
+            'is_storable': True,
+            'purchase_ok': True,
+            'route_ids': [Command.set(cls.buy_route.ids)],
+            'automated_reorder_suggestions': True,
+            'inventory_turns_target': 6,
+            'safety_factor': 1,
+            'seller_ids': [Command.create({
+                'partner_id': cls.vendor.id,
+                'min_qty': 1.0,
+                'lead_time_weeks': 2,
+                'standard_case_quantity': 12,
+            })],
+        })
+        # A manufactured parent consuming 2× the component: selling the parent
+        # drives the component's demand without any outgoing move on the
+        # component itself, so its Forecast stays controllable.
+        cls.parent = cls.env['product.product'].create({
+            'name': 'Qty Parent',
+            'is_storable': True,
+            'route_ids': [Command.set(cls.manufacture_route.ids)],
+        })
+        cls.env['mrp.bom'].create({
+            'product_tmpl_id': cls.parent.product_tmpl_id.id,
+            'product_qty': 1.0,
+            'bom_line_ids': [Command.create({
+                'product_id': cls.component.id,
+                'product_qty': 2.0,
+            })],
+        })
+        cls._age_product(cls.component, 200)
+
+    @classmethod
+    def _age_product(cls, product, days):
+        moment = fields.Datetime.now() - timedelta(days=days)
+        product.flush_recordset()
+        cls.env.cr.execute(
+            'UPDATE product_product SET create_date = %s WHERE id = %s',
+            (moment, product.id))
+        cls.env.cr.execute(
+            'UPDATE product_template SET create_date = %s WHERE id = %s',
+            (moment, product.product_tmpl_id.id))
+        product.invalidate_recordset(['create_date'])
+        product.product_tmpl_id.invalidate_recordset(['create_date'])
+
+    @classmethod
+    def _sell(cls, product, qty, days_ago):
+        order = cls.env['sale.order'].with_company(cls.company).create({
+            'partner_id': cls.customer.id,
+            'company_id': cls.company.id,
+            'order_line': [Command.create(
+                {'product_id': product.id, 'product_uom_qty': qty})],
+        })
+        order.action_confirm()
+        moment = fields.Datetime.now() - timedelta(days=days_ago)
+        order.flush_recordset()
+        cls.env.cr.execute(
+            'UPDATE sale_order SET date_order = %s WHERE id = %s', (moment, order.id))
+        order.invalidate_recordset(['date_order'])
+        return order
+
+    def _orderpoint(self, product):
+        return self.env['stock.warehouse.orderpoint'].create({
+            'product_id': product.id,
+            'company_id': self.company.id,
+            'warehouse_id': self.warehouse.id,
+            'location_id': self.warehouse.lot_stock_id.id,
+            'trigger': 'manual',
+        })
+
+    def test_min_max_to_order_when_below_rop(self):
+        # Parent sold 13 units 30 days ago -> component RGD 26 in the 3-month
+        # window -> Greatest WAD = 26/13 = 2.0.
+        self._sell(self.parent, 13, 30)
+        orderpoint = self._orderpoint(self.component)
+        # ROP = 2.0 * (2 lead + 1 safety) = 6.0.
+        self.assertAlmostEqual(orderpoint.reorder_min, 6.0, places=3)
+        # Base TOQ 2*52/6 = 17.333; + shortfall (6-0) = 23.333; MOQ 1;
+        # round up to the 12-unit case -> 24.
+        self.assertAlmostEqual(orderpoint.reorder_to_order, 24.0, places=3)
+        # Max = Forecast (0) + Final TOQ.
+        self.assertAlmostEqual(orderpoint.reorder_max, 24.0, places=3)
+
+    def test_to_order_zero_when_forecast_meets_rop(self):
+        self._sell(self.parent, 13, 30)
+        self.env['stock.quant']._update_available_quantity(
+            self.component, self.warehouse.lot_stock_id, 100.0)
+        orderpoint = self._orderpoint(self.component)
+        self.assertAlmostEqual(orderpoint.reorder_min, 6.0, places=3)
+        self.assertEqual(orderpoint.reorder_to_order, 0.0)
+        # With nothing to order, Max collapses to just the Forecast.
+        self.assertAlmostEqual(orderpoint.reorder_max, orderpoint.qty_forecast, places=3)
+
+    def test_no_values_without_vendor(self):
+        novendor = self.env['product.product'].create({
+            'name': 'Qty No Vendor',
+            'is_storable': True,
+            'purchase_ok': True,
+            'route_ids': [Command.set(self.buy_route.ids)],
+        })
+        orderpoint = self._orderpoint(novendor)
+        self.assertEqual(orderpoint.reorder_min, 0.0)
+        self.assertEqual(orderpoint.reorder_max, 0.0)
+        self.assertEqual(orderpoint.reorder_to_order, 0.0)
+        self.assertFalse(orderpoint.reorder_vendor_id)
+
+    def test_reorder_orders_the_suggested_quantity(self):
+        self._sell(self.parent, 13, 30)
+        orderpoint = self._orderpoint(self.component)
+        self.assertAlmostEqual(orderpoint.reorder_to_order, 24.0, places=3)
+
+        orderpoint.action_reorder_suggestion_replenish()
+
+        lines = self.env['purchase.order.line'].search([
+            ('product_id', '=', self.component.id),
+            ('order_id.partner_id', '=', self.vendor.id),
+        ])
+        self.assertEqual(len(lines), 1)
+        # Final TOQ, not the native computed quantity — the native Min/Max on
+        # this orderpoint are both 0, so native alone would order nothing.
+        self.assertAlmostEqual(lines.product_qty, 24.0, places=3)
+
+    def test_reorder_refuses_when_nothing_is_suggested(self):
+        self.env['stock.quant']._update_available_quantity(
+            self.component, self.warehouse.lot_stock_id, 100.0)
+        orderpoint = self._orderpoint(self.component)
+        self.assertEqual(orderpoint.reorder_to_order, 0.0)
+        with self.assertRaises(UserError):
+            orderpoint.action_reorder_suggestion_replenish()
