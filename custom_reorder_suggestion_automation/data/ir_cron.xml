@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+    <!-- Nightly recalculation of the re-order suggestions. The engine reads a
+         year of confirmed sale lines and explodes BOMs, which is far too heavy
+         to hang off qty_forecast and run inside every stock move. -->
+    <record id="ir_cron_update_reorder_suggestions" model="ir.cron">
+        <field name="name">Re-Order Suggestions: recompute</field>
+        <field name="model_id" ref="stock.model_stock_warehouse_orderpoint"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_update_reorder_suggestions()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">1</field>
+        <field name="interval_type">days</field>
+        <field name="active" eval="True"/>
+        <!-- ir.cron schedules in UTC and keeps the time of day as it advances
+             nextcall, so 09:00 UTC stays overnight everywhere in the US:
+             01:00 PST / 02:00 PDT, 02:00 MST / 03:00 MDT,
+             04:00 EST / 05:00 EDT. Dated in the past so the first run
+             backfills the columns right after installation. -->
+        <field name="nextcall">2020-01-01 09:00:00</field>
+    </record>
+</odoo>

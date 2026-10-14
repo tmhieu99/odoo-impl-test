@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="res_config_settings_view_form_reorder_suggestion_automation" model="ir.ui.view">
+        <field name="name">res.config.settings.reorder.suggestion.automation.form</field>
+        <field name="model">res.config.settings</field>
+        <field name="inherit_id" ref="purchase.res_config_settings_view_form_purchase"/>
+        <field name="arch" type="xml">
+            <xpath expr="//block[@name='matrix_setting_container']" position="after">
+                <block title="Automated Re-Order Suggestions" name="reorder_suggestion_setting_container">
+                    <setting id="reorder_default_inventory_turns_target"
+                             string="Default Inventory Turns Target"
+                             help="Pre-filled on new products and when Automated Reorder Suggestions is enabled on a product without one">
+                        <field name="reorder_default_inventory_turns_target"/>
+                    </setting>
+                    <setting id="reorder_default_safety_factor"
+                             string="Default Safety Factor (Weeks)"
+                             help="Pre-filled on new products and when Automated Reorder Suggestions is enabled on a product without one">
+                        <field name="reorder_default_safety_factor"/>
+                    </setting>
+                </block>
+            </xpath>
+        </field>
+    </record>
+</odoo>

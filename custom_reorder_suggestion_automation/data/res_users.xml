@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+    <!-- Owner (create_uid) of the orderpoints the nightly cron creates for
+         flagged SKUs. Native Odoo garbage-collects manual orderpoints created by
+         SUPERUSER_ID that have nothing to order (`_unlink_processed_orderpoints`
+         and the end of `action_replenish`) — that is how it recognises the rows
+         its own Replenishment page generated. The cron runs as SUPERUSER_ID, so
+         without a different owner our rows would vanish within a day. Archived:
+         it never logs in and is not a billable user. -->
+    <record id="user_reorder_suggestion" model="res.users">
+        <field name="name">Re-Order Suggestions</field>
+        <field name="login">__reorder_suggestion__</field>
+        <field name="active" eval="False"/>
+    </record>
+</odoo>
